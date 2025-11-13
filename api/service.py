@@ -24,8 +24,10 @@ headers = {
 }
 
 def get_article_content(article_content: str, debug_filename='debug_extracted_text.txt'):
+    # Use path relative to this file's location
+    query_txt_path = os.path.join(os.path.dirname(__file__), 'query.txt')
     
-    with open('query.txt', 'r', encoding='utf-8') as f:
+    with open(query_txt_path, 'r', encoding='utf-8') as f:
         query_template = f.read()
     
     llm_query = query_template.format(article_content=article_content)
@@ -74,20 +76,25 @@ def generate_vectorized_knowledge_base():
 
     print("Generating vectorized knowledge base from class files...")
     
-    classes_dir = 'classes'
+    # Use paths relative to this file's location
+    base_dir = os.path.dirname(__file__)
+    classes_dir = os.path.join(base_dir, 'classes')
+    classes_json_path = os.path.join(base_dir, 'classes.json')
+    
     if not os.path.exists(classes_dir):
         return {
-            'message': 'Error: classes directory not found. Run generate_knowledge_base() first.',
+            'message': f'Error: classes directory not found at {classes_dir}. Run generate_knowledge_base() first.',
             'success': False
         }
     
-    with open('classes.json', 'r') as f:
+    with open(classes_json_path, 'r') as f:
         classes = json.load(f)
     
     embeddings_data = []
     successful = 0
     failed = 0
     total_chunks = 0
+    global_chunk_id = 0  # Auto-incrementing ID for all chunks
     
     for class_key in classes.keys():
         file_path = f"{classes_dir}/{class_key}.txt"
@@ -112,28 +119,29 @@ def generate_vectorized_knowledge_base():
             print(f"Processing {len(chunks)} chunks...")
             
             chunks_processed = 0
-            for chunk_idx, chunk in enumerate(chunks):
-                try:
-                    response = generate_embedding_vector(chunk)
-                    
-                    if response and 'data' in response and response['data']:
-                        embedding = response['data'][0]['embedding']
+            response = generate_embedding_vector(chunks)
+            if response and 'data' in response and response['data']:
+                for chunk_idx, chunk in enumerate(chunks):
+                    try:
+                        embedding = response['data'][chunk_idx]['embedding']
                         
                         embeddings_data.append({
+                            'id': global_chunk_id,  # Auto-incrementing integer ID
                             'class_name': class_key,
-                            'chunk_id': f"{class_key}_chunk_{chunk_idx}",
                             'chunk_index': chunk_idx,
                             'chunk_text': chunk,
                             'chunk_length': len(chunk),
-                            'embedding': embedding,
+                            'vector': embedding,  # MilvusClient uses 'vector' not 'embedding'
                             'file_path': file_path
                         })
                         
+                        global_chunk_id += 1
                         chunks_processed += 1
                         
-                except Exception:
-                    continue
-            
+                    except Exception as e:
+                        print(f"✗ Error processing chunk {chunk_idx}: {e}")
+                        failed += 1
+                        continue
             if chunks_processed > 0:
                 print(f"✓ Processed {chunks_processed}/{len(chunks)} chunks")
                 successful += 1
@@ -141,36 +149,44 @@ def generate_vectorized_knowledge_base():
             else:
                 print(f"✗ Failed to process chunks")
                 failed += 1
+                continue
             
         except Exception as e:
             print(f"✗ Unexpected error processing {class_key}: {e}")
             failed += 1
             continue
     
+    # Save embeddings to Milvus database
     if embeddings_data:
+        print(f"\n Inserting {len(embeddings_data)} chunks into Milvus...")
         milvus_client.insert(collection_name=collection_name, data=embeddings_data)
-        print(f"\n✓ Saved {total_chunks} chunks from {successful} classes")
+        print(f"✓ Successfully saved {len(embeddings_data)} chunks to database")
+    else:
+        print("No embeddings data to save!")
     
     return {
+        'id': collection_name,
         'message': f'Vectorized knowledge base generated! Success: {successful}, Failed: {failed}, Total chunks: {total_chunks}',
         'successful_classes': successful,
         'failed_classes': failed,
         'total_classes': len(classes),
         'total_chunks': total_chunks,
-        'embeddings_file': 'embeddings.json'
+        'chunks_in_db': len(embeddings_data)
     }
-
-def retrieve_most_relevant_documents(query: str):
-    return {'message': 'Most relevant documents retrieved!'}
 
 def generate_knowledge_base():
     """Scrape all classes and save each to a separate file"""
+    # Use paths relative to this file's location
+    base_dir = os.path.dirname(__file__)
+    classes_json_path = os.path.join(base_dir, 'classes.json')
+    classes_dir = os.path.join(base_dir, 'classes')
+    
     # Load classes from JSON
-    with open('classes.json', 'r') as f:
+    with open(classes_json_path, 'r') as f:
         classes = json.load(f)
     
     # Create classes directory if it doesn't exist
-    os.makedirs('classes', exist_ok=True)
+    os.makedirs(classes_dir, exist_ok=True)
     
     # URL endings to append
     url_endings = ['guide', 'rotation-cooldowns-abilities']
@@ -209,7 +225,7 @@ def generate_knowledge_base():
                 print(f"✗ Invalid LLM response for {class_key}, skipping file write...")
                 continue
             
-            output_file = f"classes/{class_key}.txt"
+            output_file = os.path.join(classes_dir, f"{class_key}.txt")
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(llm_result['message'])
             
@@ -231,7 +247,7 @@ def retrieve_answers(query_text: str):
     milvus_client = MilvusClient(uri=db_path)
     
     # Generate embedding for the query
-    embedding_response = generate_embedding_vector(query_text)
+    embedding_response = generate_embedding_vector([query_text])
     
     # Extract the actual embedding vector from the response
     if not embedding_response or 'data' not in embedding_response or not embedding_response['data']:
@@ -250,31 +266,44 @@ def retrieve_answers(query_text: str):
         },
         output_fields=['class_name', 'chunk_text', 'chunk_index'],
     )
+
+    print("Search results: ", search_res)
     
-    # Use the class from the top-scoring chunk (most relevant)
+    # Check if we have results
     if not search_res[0]:
         return {'message': 'No results found', 'success': False}
     
-    top_class = search_res[0][0]['class_name']  # Class of the highest-scoring chunk
-    top_score = search_res[0][0]['distance']
+    # Take top results regardless of class (up to 8 chunks)
+    top_results = search_res[0][:8]
     
-    # Filter results to only include chunks from the most relevant class
-    filtered_results = [r for r in search_res[0] if r['class_name'] == top_class][:6]
+    # Group results by class to show which classes are relevant
+    classes_involved = {}
+    for result in top_results:
+        class_name = result['class_name']
+        if class_name not in classes_involved:
+            classes_involved[class_name] = []
+        classes_involved[class_name].append(result)
     
-    # Build context from filtered results
+    # Build context organized by class
     context_parts = []
-    for idx, result in enumerate(filtered_results, 1):
-        context_parts.append(f"[Chunk {idx} from {result['class_name']}]\n{result['chunk_text']}\n")
+    for class_name, results in classes_involved.items():
+        context_parts.append(f"\n=== {class_name} ===")
+        for result in results:
+            context_parts.append(f"{result['chunk_text']}")
     
     context = "\n".join(context_parts)
     context = context.replace('\n', ' ').replace('\r', ' ')
     context = clean_text(context)
     
+    # Determine primary class (for metadata)
+    primary_class = search_res[0][0]['class_name']
+    primary_score = search_res[0][0]['distance']
+    classes_list = list(classes_involved.keys())
+    
     llm_query = f"""You are a World of Warcraft class guide expert. 
-    Answer only the user's question based on the provided context. 
-    Do not include any other information.
+    Answer the user's question based on the provided context.
 
-    Context (from {top_class} guide):
+    Context from relevant class guides:
     {context}
 
     User Question:
@@ -282,7 +311,7 @@ def retrieve_answers(query_text: str):
 
     Instructions:
     - Answer based ONLY on the provided context
-    - Focus specifically on {top_class}
+    - If multiple classes are mentioned, address each one relevant to the question
     - Format your response in clear, well-organized markdown
     - If the context doesn't contain enough information, say so
     - Be concise but comprehensive
@@ -293,6 +322,7 @@ def retrieve_answers(query_text: str):
     return {
         'message': 'Results retrieved', 
         'response': llm_response,
-        'source_class': top_class,
-        'confidence_score': top_score
+        'primary_class': primary_class,
+        'classes_involved': classes_list,
+        'confidence_score': primary_score
     }

@@ -150,9 +150,9 @@ def split_into_chunks(text: str, chunk_size: int = 2000, overlap: int = 200):
     
     return chunks
 
-def generate_embedding_vector(chunk: str):
-    """Generate embedding for a single chunk"""
-    data['input'] = chunk
+def generate_embedding_vector(chunks: list[str]):
+    """Generate embedding for a list of chunks"""
+    data['input'] = chunks
     response = requests.post(api_url, headers=headers, json=data)
     response.raise_for_status()
     return response.json()
